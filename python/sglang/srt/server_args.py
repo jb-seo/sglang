@@ -5922,6 +5922,22 @@ class ServerArgs:
                 # FlashInfer does not support attention sinks.
                 if is_flashinfer_available() and not model_config.has_attention_sinks:
                     return "flashinfer"
+                # Name the rejected candidate and the reason: this drop to triton
+                # is the one auto-selection step that used to be silent.
+                reason = (
+                    "the model uses learned attention sinks, which FlashInfer "
+                    "does not support"
+                    if is_flashinfer_available()
+                    else "FlashInfer is unavailable in this process (not "
+                    "importable, device is not CUDA, or "
+                    "SGLANG_IS_FLASHINFER_AVAILABLE is falsy)"
+                )
+                logger.info(
+                    "Auto-selected attention backend 'triton' instead of "
+                    "'flashinfer': %s. Pass --attention-backend explicitly to "
+                    "override.",
+                    reason,
+                )
                 return "triton"
         else:
             # MLA architecture
