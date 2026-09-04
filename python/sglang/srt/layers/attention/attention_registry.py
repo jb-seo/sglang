@@ -388,23 +388,46 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         )
         hybrid_backend_cls = HybridLinearAttnBackend
         if hybrid_gdn_config(runner.model_config) is not None:
+            prefill_be = runner.prefill_attention_backend_str
+            decode_be = runner.decode_attention_backend_str
+            # Full-attention allow-list, if this platform has one. Only
+            # Blackwell and NPU constrain the softmax-attention layers; every
+            # other architecture (Ampere/Ada/Hopper/ROCm) accepts whatever
+            # --attention-backend resolved to, flashinfer included.
+            allowed = None
             if is_blackwell():
                 if is_sm120_supported():
                     allowed = {"triton", "trtllm_mha", "flashinfer"}
                 else:
                     allowed = {"triton", "trtllm_mha", "fa4"}
-                prefill_be = runner.prefill_attention_backend_str
-                decode_be = runner.decode_attention_backend_str
                 assert prefill_be in allowed and decode_be in allowed, (
-                    f"Only {allowed} backends are supported on Blackwell GPUs for hybrid GDN models. "
-                    f"Got prefill={prefill_be}, decode={decode_be}."
+                    f"Only {sorted(allowed)} full-attention backends are supported on "
+                    f"Blackwell GPUs for hybrid GDN models. "
+                    f"Got prefill={prefill_be}, decode={decode_be}. "
+                    "This restriction is Blackwell-only; the GDN linear-attention "
+                    "layers are chosen separately via --linear-attn-backend."
                 )
             elif is_npu():
-                assert (
-                    runner.prefill_attention_backend_str == "ascend"
-                    and runner.decode_attention_backend_str == "ascend"
-                ), "ascend backend is the only supported backend on NPU for hybrid GDN models, use --attention-backend ascend to specify the backend."
-            logger.info(f"Using hybrid linear attention backend for hybrid GDN models.")
+                allowed = {"ascend"}
+                assert prefill_be in allowed and decode_be in allowed, (
+                    f"Only {sorted(allowed)} full-attention backends are supported on "
+                    f"NPU for hybrid GDN models, use --attention-backend ascend to "
+                    f"specify the backend. "
+                    f"Got prefill={prefill_be}, decode={decode_be}."
+                )
+            # One line naming both halves of the hybrid, so a boot log shows at a
+            # glance which kernels serve the softmax layers and which serve GDN.
+            logger.info(
+                "Hybrid GDN model: full attention on prefill=%s decode=%s "
+                "(--attention-backend, allowed on this platform: %s); GDN linear "
+                "attention on prefill=%s decode=%s verify=%s (--linear-attn-backend).",
+                prefill_be,
+                decode_be,
+                sorted(allowed) if allowed is not None else "unrestricted",
+                runner.linear_attn_backends.prefill.value,
+                runner.linear_attn_backends.decode.value,
+                runner.linear_attn_backends.verify.value,
+            )
             linear_attn_backend = GDNAttnBackend(runner)
         elif mamba2_config(runner.model_config) is not None:
             from sglang.srt.configs.lfm2 import Lfm2Config
