@@ -52,16 +52,21 @@ def filler(tag, n_words):
     return " ".join(f"{tag}{i}" for i in range(n_words))
 
 
-def run_round(url, words, label):
-    A = filler("alpha", words)
-    B = filler("bravo", words)   # shares nothing with A
+def run_round(url, words, label, other_words=None, tag=""):
+    """One A/B/A probe. `other_words` sizes the intervening session separately,
+    so 'A is long' and 'the request that interrupted it was long' are not the
+    same knob -- in a single-size round they move together and the result
+    cannot say which one mattered."""
+    other_words = words if other_words is None else other_words
+    A = filler("alpha" + tag, words)
+    B = filler("bravo" + tag, other_words)   # shares nothing with A
     steps = [
         ("A1 cold A",                 A + " Q1"),
         ("A2 A again, no gap",        A + " Q2"),
         ("B1 other session",          B + " Q1"),
         ("A3 back to A  <-- KEY",     A + " Q3"),
     ]
-    print(f"\n=== {label}: ~{words} words ===")
+    print(f"\n=== {label}: A~{words}w, B~{other_words}w ===")
     rows = []
     for name, prompt in steps:
         try:
@@ -204,30 +209,57 @@ def main():
     ap.add_argument("--grow-max", type=int, default=2500,
                     help="simulate: most words a turn adds")
     ap.add_argument("--seed", type=int, default=0, help="simulate: reproducible order")
+    ap.add_argument("--repeat", type=int, default=3,
+                    help="ab: repeats per cell (1 tells you nothing)")
     a = ap.parse_args()
 
     if a.mode == "simulate":
         run_simulate(a.url, a)
         return
 
-    short_rows = run_round(a.url, a.short, "SHORT")
-    long_rows = run_round(a.url, a.long, "LONG")
+    # Four cells, so a miss can be attributed. If only (long A, long B) fails
+    # the pressure needs both; if every long-B cell fails it is the
+    # interrupting request's size; if every long-A cell fails it is the
+    # probed session's own.
+    cells = [
+        ("short A / short B", a.short, a.short),
+        ("short A / LONG  B", a.short, a.long),
+        ("LONG  A / short B", a.long, a.short),
+        ("LONG  A / LONG  B", a.long, a.long),
+    ]
+    results = {name: [] for name, _, _ in cells}
+    for rep in range(a.repeat):
+        for ci, (name, w, ow) in enumerate(cells):
+            # A fresh tag per (repeat, cell). Sharing one across cells lets a
+            # cell hit on the previous cell's tree, which measures nothing.
+            rows = run_round(a.url, w, f"[rep {rep + 1}] {name}",
+                             other_words=ow, tag=f"r{rep}c{ci}")
+            results[name].append(verdict(rows))
 
-    sv, lv = verdict(short_rows), verdict(long_rows)
     print("\n" + "=" * 62)
-    print(f"  SHORT context : {sv}")
-    print(f"  LONG  context : {lv}")
+    print(f"  {a.repeat} repeat(s) per cell -- a single run proves nothing here")
+    print("=" * 62)
+    for name, _, _ in cells:
+        vs = results[name]
+        agree = "consistent" if len(set(vs)) == 1 else "INCONSISTENT"
+        print(f"  {name:20s} {agree:12s} {vs}")
     print("=" * 62)
     print("""
-  short survives, long killed -> length-dependent. Consistent with mamba
-                                 checkpoints being evicted on the long path.
-  both killed                 -> not length-dependent. Mamba pool pressure is
-                                 NOT the cause; look elsewhere.
-  both survive                -> alternation alone is innocent; the real
-                                 trigger is something else (Stop, compaction,
-                                 a changed system prompt).
-  "no hit even without a gap" -> caching is broken outright, independent of
-                                 sessions.
+  Read the four cells together; one cell on its own attributes nothing.
+
+    only LONG A / LONG B fails  -> pressure needs both sides large.
+    both LONG-B cells fail      -> the INTERRUPTING request's size is what
+                                   evicts; the probed session's length is
+                                   incidental.
+    both LONG-A cells fail      -> the probed session's own length decides;
+                                   what interrupted it does not matter.
+    all four fail               -> length is not the variable at all.
+    none fail                   -> alternation is innocent here; the real
+                                   trigger is elsewhere (Stop, compaction, a
+                                   changed system prompt).
+
+  Any cell marked INCONSISTENT means the run-to-run variance is larger than
+  the effect. Raise --repeat before drawing anything from it.
 """)
 
 
