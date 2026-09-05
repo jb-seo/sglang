@@ -33,33 +33,67 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 
 
+def _post(url, path, payload, timeout):
+    req = urllib.request.Request(
+        url + path, data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read())
+
+
+API = "sglang"   # set from --api; "openai" also works against vLLM
+MODEL = None     # required by the OpenAI route
+
+
 def gen(url, prompt, max_new_tokens=1, timeout=900):
     """One call. Returns (secs, prompt_tokens, cached_tokens, completion_tokens,
     text).
 
-    max_new_tokens matters more than it looks. A request holds its mamba slots
-    for as long as it runs, and crosses a state-tracking boundary every
-    mamba_track_interval decoded tokens -- so a 1-token call measures prefill
-    reuse while barely occupying the server, which is not the workload anyone
-    actually runs.
+    Two routes. The native one reads SGLang's meta_info. The OpenAI one uses
+    /v1/completions and usage.prompt_tokens_details.cached_tokens, which both
+    SGLang and vLLM serve -- so the same workload can be pointed at either
+    engine and the numbers mean the same thing. A cache result that only one
+    of them reproduces says more than any amount of reading one of them.
+
+    max_new_tokens matters more than it looks. A request holds its state slots
+    for as long as it runs, so a 1-token call measures prefill reuse while
+    barely occupying the server, which is not the workload anyone runs.
     """
-    req = urllib.request.Request(
-        url + "/generate",
-        data=json.dumps(
-            {"text": prompt,
-             "sampling_params": {"max_new_tokens": max_new_tokens,
-                                 "temperature": 0.0}}
-        ).encode(),
-        headers={"Content-Type": "application/json"},
-    )
     t0 = time.perf_counter()
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        out = json.loads(r.read())
+    if API == "openai":
+        out = _post(url, "/v1/completions", {
+            "model": MODEL, "prompt": prompt,
+            "max_tokens": max_new_tokens, "temperature": 0.0,
+        }, timeout)
+        dt = time.perf_counter() - t0
+        usage = out.get("usage") or {}
+        details = usage.get("prompt_tokens_details") or {}
+        text = (out.get("choices") or [{}])[0].get("text", "")
+        return (dt, usage.get("prompt_tokens"), details.get("cached_tokens"),
+                usage.get("completion_tokens"), text)
+
+    out = _post(url, "/generate", {
+        "text": prompt,
+        "sampling_params": {"max_new_tokens": max_new_tokens,
+                            "temperature": 0.0},
+    }, timeout)
     dt = time.perf_counter() - t0
     meta = out.get("meta_info", {}) if isinstance(out, dict) else {}
     text = out.get("text", "") if isinstance(out, dict) else ""
     return (dt, meta.get("prompt_tokens"), meta.get("cached_tokens"),
             meta.get("completion_tokens"), text)
+
+
+def resolve_model(url, timeout=30):
+    """First model the server lists, so --model can usually be left off."""
+    try:
+        out = _post.__globals__["urllib"].request.urlopen(
+            url + "/v1/models", timeout=timeout)
+        data = json.loads(out.read())
+        return (data.get("data") or [{}])[0].get("id")
+    except Exception:
+        return None
 
 
 def filler(tag, n_words):
@@ -136,6 +170,7 @@ class Session:
         self.turn = 0
         self.epoch = 0          # bumped on compaction: changes the prefix
         self.last_reply = ""
+        self.last_action = "grow"
         self.prev_cacheable_tokens: int | None = None
 
     def est_tokens(self) -> int:
@@ -170,8 +205,14 @@ class Session:
         return "compact"
 
     def next_prompt(self, action: str) -> str:
+        # Nothing to shrink or summarise yet. Without this a session's first
+        # turn can be a shrink of an empty history, which sends a 3-token
+        # prompt and makes the NEXT turn look like a wipeout of it.
+        if not self.words:
+            action = "grow"
         act = {"grow": self.grow, "shrink": self.shrink,
                "compact": self.compact}[action]()
+        self.last_action = act
         self.turn += 1
         return " ".join(self.words) + f" turn{self.turn}?"
 
@@ -268,6 +309,7 @@ def run_simulate(url, args):
                             action = "grow"
                         expect = sess.prev_cacheable_tokens
                         prompt = sess.next_prompt(action)
+                        action = sess.last_action
                         inflight.add(tag)
                         at_issue = len(inflight)
                         peak = max(peak, at_issue)
@@ -353,6 +395,13 @@ def run_simulate(url, args):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", default="http://localhost:8010")
+    ap.add_argument("--api", choices=["sglang", "openai"], default="sglang",
+                    help="openai uses /v1/completions and reads "
+                         "usage.prompt_tokens_details.cached_tokens, which "
+                         "vLLM serves too -- use it to run the same workload "
+                         "against both engines")
+    ap.add_argument("--model", default=None,
+                    help="openai: model id (default: first one the server lists)")
     ap.add_argument("--mode", choices=["ab", "simulate"], default="ab")
     ap.add_argument("--short", type=int, default=1500, help="ab: words, short round")
     ap.add_argument("--long", type=int, default=20000, help="ab: words, long round")
@@ -380,6 +429,14 @@ def main():
     ap.add_argument("--repeat", type=int, default=3,
                     help="ab: repeats per cell (1 tells you nothing)")
     a = ap.parse_args()
+
+    global API, MODEL
+    API = a.api
+    if API == "openai":
+        MODEL = a.model or resolve_model(a.url)
+        if not MODEL:
+            sys.exit("could not resolve a model id; pass --model")
+        print(f"api=openai model={MODEL}")
 
     if a.mode == "simulate":
         run_simulate(a.url, a)
