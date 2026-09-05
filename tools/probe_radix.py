@@ -114,35 +114,64 @@ def verdict(rows):
 
 
 class Session:
-    """One conversation that grows a turn at a time.
+    """One conversation, with the three things real ones do to their history.
 
-    Each turn appends to the previous prompt, so turn N's prompt has turn
-    N-1's whole prompt as a strict prefix -- exactly what the radix tree is
-    supposed to hand back. That prior length is the yardstick: hitting 90% of
-    the total prompt means nothing if the last 10% was all that was new.
+    grow     append a turn. The previous prompt and reply stay a strict
+             prefix, so the tree should hand all of it back.
+    shrink    drop the oldest turns to stay under a limit. The prefix changes
+             at token 0, so a miss here is correct, not a failure.
+    compact   replace the history with a summary -- a new system prompt and a
+             condensed transcript. Also a miss by construction, and the
+             expensive one, since what follows is a full prefill.
+
+    Separating them matters: lumping compactions in with growth reads as a
+    broken cache, and hiding them reads as a workload nobody runs.
     """
 
-    def __init__(self, tag: str, rng: random.Random, grow_min: int, grow_max: int):
+    def __init__(self, tag, rng, grow_min, grow_max):
         self.tag = tag
         self.rng = rng
         self.grow_min, self.grow_max = grow_min, grow_max
         self.words: list[str] = []
         self.turn = 0
+        self.epoch = 0          # bumped on compaction: changes the prefix
         self.last_reply = ""
-        # What the server should be able to hand back next time: this turn's
-        # prompt plus what it generated, since both are in the tree.
         self.prev_cacheable_tokens: int | None = None
 
-    def next_prompt(self) -> str:
-        """Append the last reply plus a turn's worth of words, and return the
-        whole conversation -- so the previous turn's prompt AND its answer are
-        both a prefix of this one, as in a real chat."""
+    def est_tokens(self) -> int:
+        return int(len(self.words) * 1.3)
+
+    def _tok(self, i: int) -> str:
+        return f"{self.tag}e{self.epoch}w{i}"
+
+    def grow(self) -> str:
         n = self.rng.randint(self.grow_min, self.grow_max)
         base = len(self.words)
         if self.last_reply:
             self.words += self.last_reply.split()
             self.last_reply = ""
-        self.words += [f"{self.tag}{base + i}" for i in range(n)]
+        self.words += [self._tok(base + i) for i in range(n)]
+        return "grow"
+
+    def shrink(self) -> str:
+        """Drop the oldest third: the head changes, so nothing matches."""
+        self.last_reply = ""
+        self.words = self.words[len(self.words) // 3 :]
+        self.epoch += 1
+        self.words = [self._tok(i) for i in range(len(self.words))]
+        return "shrink"
+
+    def compact(self) -> str:
+        """Summarise: a fresh, much shorter history under a new prefix."""
+        self.last_reply = ""
+        keep = max(self.grow_min, len(self.words) // 8)
+        self.epoch += 1
+        self.words = [self._tok(i) for i in range(keep)]
+        return "compact"
+
+    def next_prompt(self, action: str) -> str:
+        act = {"grow": self.grow, "shrink": self.shrink,
+               "compact": self.compact}[action]()
         self.turn += 1
         return " ".join(self.words) + f" turn{self.turn}?"
 
@@ -158,6 +187,10 @@ def run_simulate(url, args):
     # runs at different concurrency compare the same workload. Only the
     # overlap between calls varies.
     order = [rng.choice(tags) for _ in range(args.turns)]
+    # Actions are drawn here too, before any timing, so runs stay comparable.
+    # The budget check is the exception: it depends on how big sessions have
+    # actually grown, so it is applied at issue time and can override.
+    draws = [rng.random() for _ in range(args.turns)]
 
     print(f"\n{args.sessions} sessions, {args.turns} calls, "
           f"concurrency={args.concurrency}, gen_tokens={args.gen_tokens}, "
@@ -165,15 +198,16 @@ def run_simulate(url, args):
     print("'reuse' is cached tokens as a fraction of the previous turn's prompt")
     print("-- the part the tree already held. 100% = perfect, 0% = full recompute.")
     print("'inflt' is how many calls were in flight when this one was issued.\n")
-    print(f"{'#':>3} {'sess':>4} {'turn':>4} {'inflt':>5} {'prompt':>8} "
-          f"{'cached':>8} {'expect':>8} {'reuse':>7} {'secs':>7}")
+    print(f"{'#':>3} {'sess':>4} {'turn':>4} {'action':>8} {'inflt':>5} "
+          f"{'prompt':>8} {'cached':>8} {'expect':>8} {'reuse':>8} {'secs':>7}")
+    print("(* = shrink/compact rewrote the prefix; a miss there is correct)")
 
     lock = threading.Lock()
     inflight: set[str] = set()
     peak = 0
     rows = []
 
-    def do_call(seq, sess, expect, prompt, at_issue):
+    def do_call(seq, sess, expect, prompt, at_issue, action):
         nonlocal rows
         try:
             dt, ptok, ctok, gtok, text = gen(url, prompt, args.gen_tokens)
@@ -188,13 +222,19 @@ def run_simulate(url, args):
             sess.last_reply = text
             sess.prev_cacheable_tokens = (ptok or 0) + (gtok or 0)
             inflight.discard(sess.tag)
+            # A miss after shrink/compact is the correct answer, not a
+            # failure: those rewrite the prefix on purpose.
+            expected_miss = action in ("shrink", "compact")
+            shown = "-" if reuse is None else (
+                f"{reuse:6.1%}" + ("*" if expected_miss else "")
+            )
             print(
-                f"{seq:>3} {sess.tag:>4} {sess.turn:>4} {at_issue:>5} {ptok:>8} "
-                f"{ctok:>8} {'-' if expect is None else expect:>8} "
-                f"{'-' if reuse is None else f'{reuse:6.1%}':>7} {dt:>7.2f}"
+                f"{seq:>3} {sess.tag:>4} {sess.turn:>4} {action:>8} {at_issue:>5} "
+                f"{ptok:>8} {ctok:>8} {'-' if expect is None else expect:>8} "
+                f"{shown:>8} {dt:>7.2f}"
             )
             if reuse is not None:
-                rows.append((sess.tag, expect, reuse, at_issue))
+                rows.append((sess.tag, expect, reuse, at_issue, action))
 
     with ThreadPoolExecutor(max_workers=max(args.concurrency, 1)) as pool:
         futures = []
@@ -206,14 +246,35 @@ def run_simulate(url, args):
                 with lock:
                     if tag not in inflight and len(inflight) < args.concurrency:
                         sess = sessions[tag]
+                        total = sum(x.est_tokens() for x in sessions.values())
+                        r = draws[seq - 1]
+                        if args.budget_tokens and total > args.budget_tokens:
+                            # Over the space the server has: the biggest
+                            # session compacts, which is what a client does
+                            # when it runs out of window.
+                            biggest = max(sessions.values(),
+                                          key=lambda x: x.est_tokens())
+                            if biggest.tag == tag:
+                                action = "compact"
+                            elif r < args.shrink_prob:
+                                action = "shrink"
+                            else:
+                                action = "grow"
+                        elif r < args.compact_prob:
+                            action = "compact"
+                        elif r < args.compact_prob + args.shrink_prob:
+                            action = "shrink"
+                        else:
+                            action = "grow"
                         expect = sess.prev_cacheable_tokens
-                        prompt = sess.next_prompt()
+                        prompt = sess.next_prompt(action)
                         inflight.add(tag)
                         at_issue = len(inflight)
                         peak = max(peak, at_issue)
                         break
                 time.sleep(0.005)
-            futures.append(pool.submit(do_call, seq, sess, expect, prompt, at_issue))
+            futures.append(
+                pool.submit(do_call, seq, sess, expect, prompt, at_issue, action))
         for f in futures:
             f.result()
 
@@ -221,49 +282,71 @@ def run_simulate(url, args):
         print("\nno reusable turns recorded")
         return
 
-    print("\n" + "=" * 68)
-    print(f"reuse by context size (peak concurrency reached: {peak})")
-    print("=" * 68)
-    for lo, hi in [(0, 4000), (4000, 16000), (16000, 64000), (64000, 10**9)]:
-        got = [r for _, e, r, _ in rows if lo <= e < hi]
+    grow = [(t, e, r, c) for t, e, r, c, a in rows if a == "grow"]
+    rewrote = [(t, e, r, c) for t, e, r, c, a in rows if a != "grow"]
+
+    print("\n" + "=" * 72)
+    print(f"peak concurrency {peak}   grow turns {len(grow)}   "
+          f"prefix-rewriting turns {len(rewrote)}")
+    print("Only grow turns are a verdict on the cache. The rest are counted "
+          "so the\nworkload stays honest, not so the cache gets blamed for "
+          "them.")
+    print("=" * 72)
+
+    if not grow:
+        print("  no grow turns -- raise --turns or lower the rewrite probs")
+        return
+
+    print("\nreuse on grow turns, by context size")
+    for lo, hi in [(0, 4000), (4000, 16000), (16000, 64000),
+                   (64000, 200000), (200000, 10**9)]:
+        got = [r for _, e, r, _ in grow if lo <= e < hi]
         if not got:
             continue
         hi_s = "inf" if hi > 10**8 else str(hi)
-        print(f"  {lo:>6}-{hi_s:<6} n={len(got):<4} "
-              f"mean={sum(got)/len(got):6.1%}  min={min(got):6.1%}")
+        print(f"  {lo:>7}-{hi_s:<7} n={len(got):<4} "
+              f"mean={sum(got)/len(got):6.1%}  min={min(got):6.1%}  "
+              f"wipeouts={sum(1 for r in got if r < 0.01)}")
 
-    print("\nreuse by how many calls were in flight")
+    print("\nreuse on grow turns, by calls in flight")
     by_c = defaultdict(list)
-    for _, _, r, c in rows:
+    for _, _, r, c in grow:
         by_c[c].append(r)
     for c in sorted(by_c):
         got = by_c[c]
-        print(f"  {c} in flight  n={len(got):<4} "
-              f"mean={sum(got)/len(got):6.1%}  min={min(got):6.1%}")
+        print(f"  {c} in flight  n={len(got):<4} mean={sum(got)/len(got):6.1%}  "
+              f"min={min(got):6.1%}  wipeouts={sum(1 for r in got if r < 0.01)}")
 
     per = defaultdict(list)
-    for tag, _, r, _ in rows:
+    for tag, _, r, _ in grow:
         per[tag].append(r)
-    print("\nreuse by session")
+    print("\nreuse on grow turns, by session")
     for tag in sorted(per):
         got = per[tag]
         print(f"  {tag}  n={len(got):<4} mean={sum(got)/len(got):6.1%}  "
-              f"min={min(got):6.1%}")
+              f"min={min(got):6.1%}  wipeouts={sum(1 for r in got if r < 0.01)}")
 
-    total = [r for _, _, r, _ in rows]
-    print(f"\noverall mean reuse: {sum(total)/len(total):.1%}   "
-          f"total wipeouts (0%): {sum(1 for r in total if r < 0.01)}")
+    vals = [r for _, _, r, _ in grow]
+    wipe = sum(1 for r in vals if r < 0.01)
+    partial = [r for r in vals if 0.01 <= r < 0.995]
+    print(f"\ngrow-turn mean reuse: {sum(vals)/len(vals):.1%}")
+    print(f"  wipeouts (0%): {wipe}/{len(vals)}")
+    if partial:
+        lost = [int(e * (1 - r)) for _, e, r, _ in grow if 0.01 <= r < 0.995]
+        print(f"  partial:       {len(partial)}/{len(vals)}, "
+              f"losing {min(lost)}-{max(lost)} tokens off the tail")
     print("""
-  Run the same seed at --concurrency 1 and again higher. Same call order and
-  same prompts, so a reuse figure that only drops at the higher setting is
-  concurrency, not context size -- concurrent requests hold mamba slots while
-  they run, on top of the checkpoints the tree already holds.
+  A wipeout and a partial are different failures.
 
-  --gen-tokens is the other half of that. Slots are held for the length of a
-  generation, so a short one understates the pressure a real session applies;
-  it also decides whether a request ever crosses a decode-side state-tracking
-  boundary. Compare a realistic value against 1 before concluding anything
-  about concurrency.
+    partial, a few hundred tokens, roughly constant  -> the match stops at the
+      last state checkpoint. Bounded by mamba_track_interval; the fraction
+      shrinks as the context grows. Not a leak.
+    wipeout, the whole prefix                        -> that session's
+      checkpoints are gone. Look at which sessions grew while it sat idle, and
+      at `mamba evictable` in the server log across the same window.
+
+  Run the same seed at --concurrency 1 and higher, and with --budget-tokens on
+  and off, changing one at a time. Same order, same prompts, same actions.
 """)
 
 
@@ -282,6 +365,14 @@ def main():
     ap.add_argument("--seed", type=int, default=0, help="simulate: reproducible order")
     ap.add_argument("--concurrency", type=int, default=1,
                     help="simulate: max calls in flight (1 = strictly serial)")
+    ap.add_argument("--budget-tokens", type=int, default=0,
+                    help="simulate: total token space across sessions. When "
+                         "exceeded the largest session compacts, the way a "
+                         "client does when it runs out of window. 0 = off.")
+    ap.add_argument("--compact-prob", type=float, default=0.0,
+                    help="simulate: chance a turn compacts instead of growing")
+    ap.add_argument("--shrink-prob", type=float, default=0.0,
+                    help="simulate: chance a turn drops its oldest third")
     ap.add_argument("--gen-tokens", type=int, default=256,
                     help="simulate: tokens each call generates. 1 measures "
                          "prefill reuse only; a request holds its mamba slots "
