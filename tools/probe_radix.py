@@ -68,9 +68,11 @@ def gen(url, prompt, max_new_tokens=1, timeout=900):
         }, timeout)
         dt = time.perf_counter() - t0
         usage = out.get("usage") or {}
+        # A miss omits prompt_tokens_details rather than reporting zero, so
+        # normalise here: the caller cannot tell "no hit" from "not reported".
         details = usage.get("prompt_tokens_details") or {}
         text = (out.get("choices") or [{}])[0].get("text", "")
-        return (dt, usage.get("prompt_tokens"), details.get("cached_tokens"),
+        return (dt, usage.get("prompt_tokens"), details.get("cached_tokens") or 0,
                 usage.get("completion_tokens"), text)
 
     out = _post(url, "/generate", {
@@ -395,11 +397,12 @@ def run_simulate(url, args):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", default="http://localhost:8010")
-    ap.add_argument("--api", choices=["sglang", "openai"], default="sglang",
-                    help="openai uses /v1/completions and reads "
+    ap.add_argument("--api", choices=["openai", "sglang"], default="openai",
+                    help="openai (default) uses /v1/completions and reads "
                          "usage.prompt_tokens_details.cached_tokens, which "
-                         "vLLM serves too -- use it to run the same workload "
-                         "against both engines")
+                         "SGLang and vLLM both serve, so the same workload "
+                         "compares across engines. sglang uses /generate and "
+                         "its native meta_info -- SGLang only.")
     ap.add_argument("--model", default=None,
                     help="openai: model id (default: first one the server lists)")
     ap.add_argument("--mode", choices=["ab", "simulate"], default="ab")
@@ -435,8 +438,13 @@ def main():
     if API == "openai":
         MODEL = a.model or resolve_model(a.url)
         if not MODEL:
-            sys.exit("could not resolve a model id; pass --model")
-        print(f"api=openai model={MODEL}")
+            sys.exit(f"could not list models at {a.url}/v1/models -- pass "
+                     "--model, or --api sglang if this is an SGLang server "
+                     "without the OpenAI routes")
+        print(f"api=openai  endpoint={a.url}/v1/completions  model={MODEL}")
+    else:
+        print(f"api=sglang  endpoint={a.url}/generate  "
+              "(SGLang only; vLLM has no /generate)")
 
     if a.mode == "simulate":
         run_simulate(a.url, a)
