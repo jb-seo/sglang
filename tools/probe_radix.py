@@ -216,7 +216,13 @@ class Session:
                "compact": self.compact}[action]()
         self.last_action = act
         self.turn += 1
-        return " ".join(self.words) + f" turn{self.turn}?"
+        # The question goes INTO the history, not just onto the wire. Appending
+        # it to the returned prompt only would end this turn with a marker the
+        # next turn does not repeat -- the two prompts would diverge right
+        # there, and every turn would read as a few hundred tokens of loss that
+        # is really this line.
+        self.words.append(f"turn{self.turn}?")
+        return " ".join(self.words)
 
 
 def run_simulate(url, args):
