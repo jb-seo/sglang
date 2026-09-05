@@ -808,6 +808,11 @@ class ServerArgs:
         "For chunked prefill, the maximum number of prompt tokens a single request may prefill in one scheduled pass. Requests with a longer remaining prompt are prefilled in chunks of at most this size, so up to chunked_prefill_size // threshold requests can be mid-prefill concurrently instead of one long prompt monopolizing the prefill budget. 0 (default) disables the cap: a single request may consume the whole chunked_prefill_size budget. Mirrors vLLM's --long-prefill-token-threshold.",
         NS("schedule"),
     ] = 0
+    decode_passes_per_prefill: A[
+        int,
+        "While a prefill is in flight, run this many decode passes between consecutive prefill passes. Prefill otherwise wins every pass and generation stops until the prompt finishes. A decode pass is ~100x shorter than a prefill pass, so useful values are large: ~25 gives decode roughly a quarter of the wall clock at 4096-token chunks. The scheduler logs the ratio it actually achieved -- tune against that. 0 (default) disables.",
+        NS("schedule"),
+    ] = 0
     enable_dynamic_chunking: A[
         bool,
         "Enable dynamic chunk size adjustment for pipeline parallelism. When enabled, chunk sizes are dynamically calculated based on fitted function to maintain consistent execution time across chunks.",

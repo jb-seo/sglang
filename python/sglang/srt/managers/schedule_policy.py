@@ -524,6 +524,7 @@ class PrefillAdder:
         waiting_queue_len: int = 0,
         prefill_tile_block_m: int = 64,
         long_prefill_token_threshold: int = 0,
+        yield_to_decode: bool = False,
         max_concurrent_chunked_reqs: int = 1,
     ):
         self.page_size = page_size
@@ -628,6 +629,13 @@ class PrefillAdder:
         # up to chunked_prefill_size // threshold requests can be mid-prefill
         # concurrently. 0 disables the cap (one request may drain the pool).
         self.long_prefill_token_threshold = long_prefill_token_threshold
+        # When set, the ceiling only applies while something else is waiting on
+        # the prefill budget; a request prefilling alone keeps the whole pool.
+        # This pass belongs to decode: park every carried request and admit
+        # nothing new, so can_run_list comes back empty and the caller falls
+        # through to the decode branch. Parking (not skipping) is what keeps
+        # the mid-prefill bookkeeping intact.
+        self.yield_to_decode = yield_to_decode
         # How many requests may be mid-prefill at once. Mid-prefill requests
         # pin their computed KV and cannot be retracted, so the bound also
         # caps the reserved-but-uncomputed KV held for them.
@@ -1045,7 +1053,33 @@ class PrefillAdder:
             + self._mamba_gap_budget_for_req(req)
         )
 
+    def _ceiling_applies(self) -> bool:
+        """Whether the per-request prefill ceiling should bind this pass.
+
+        Only when someone else needs the pass: a request queued behind this
+        one, or a request already decoding. vLLM applies the ceiling
+        unconditionally, but splitting a prompt that nothing is waiting on
+        buys nothing and pays per-pass overhead four times over at
+        threshold = chunked_prefill_size / 4.
+
+        In a busy server this is true almost always -- anything in the running
+        batch trips it -- so the behaviour it changes is the idle one: a long
+        prompt with the server to itself keeps the whole
+        ``chunked_prefill_size``. The cost is that a request arriving mid-pass
+        waits out a full-size chunk before the ceiling starts binding.
+        """
+        if self.long_prefill_token_threshold <= 0:
+            return False
+        return self.waiting_queue_len > 0 or len(self.running_batch.reqs) > 0
+
     def add_chunked_req(self, req: Req):
+        if self.yield_to_decode:
+            # Park, do not skip. A skipped request keeps last pass's
+            # extend_range, so the scheduler re-stashes the same chunk next
+            # pass and leaks its KV and mamba pages.
+            self._reserve_completion_for_parked_req(req)
+            return req
+
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens()
         else:
@@ -1074,7 +1108,7 @@ class PrefillAdder:
 
             # Per-request ceiling, applied to continued chunks as well: one
             # carried request cannot drain the pool ahead of the others.
-            if self.long_prefill_token_threshold > 0:
+            if self._ceiling_applies():
                 _rem_tokens = min(_rem_tokens, self.long_prefill_token_threshold)
 
         # A mid-chunk rank prefills this pass regardless of the delayer
@@ -1137,6 +1171,9 @@ class PrefillAdder:
                 self.tree_cache.dec_lock_ref(last_node)
 
     def add_one_req_ignore_eos(self, req: Req, num_chunked_reqs: int):
+        if self.yield_to_decode:
+            return AddReqResult.OTHER
+
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
@@ -1219,7 +1256,7 @@ class PrefillAdder:
         # in add_one_req: applied before the chunked/non-chunked split, so a
         # request under the ceiling still admits whole.
         chunk_tokens_limit = self.rem_chunk_tokens
-        if self.long_prefill_token_threshold > 0 and chunk_tokens_limit is not None:
+        if self._ceiling_applies() and chunk_tokens_limit is not None:
             chunk_tokens_limit = min(
                 chunk_tokens_limit, self.long_prefill_token_threshold
             )
@@ -1306,6 +1343,9 @@ class PrefillAdder:
         num_chunked_reqs: int,
         truncation_align_size: Optional[int],
     ):
+        if self.yield_to_decode:
+            return AddReqResult.OTHER
+
         """Admit one waiting request.
 
         ``num_chunked_reqs`` is how many requests are already mid-prefill,
@@ -1408,7 +1448,7 @@ class PrefillAdder:
                         return AddReqResult.NO_TOKEN
                     chunk_tokens_limit = min(self.rem_chunk_tokens, swa_cap)
 
-            if self.long_prefill_token_threshold > 0 and chunk_tokens_limit is not None:
+            if self._ceiling_applies() and chunk_tokens_limit is not None:
                 # vLLM-compatible per-request ceiling: no request prefills
                 # more than the threshold in one pass, so up to
                 # chunked_prefill_size // threshold requests can be

@@ -1194,6 +1194,19 @@ class Scheduler(
         # carried across passes until their prefill completes. Ordered oldest
         # first, so budget is handed out in admission order.
         self.chunked_reqs: List[Req] = []
+        # Decaying wall-time spent in prefill vs decode passes, for
+        # --decode-time-share. Both decay with the configured half-life so the
+        # ratio tracks recent behaviour instead of the whole run.
+        self._prefill_time_acc = 0.0
+        self._decode_time_acc = 0.0
+        # EWMA of how long one prefill pass takes, used to pre-pay for the
+        # next one (see _should_yield_pass_to_decode).
+        self._prefill_pass_est = 0.0
+        # Length of the current run of yielded passes, for the diagnostics and
+        # the safety cap in _should_yield_pass_to_decode.
+        self._consecutive_yields = 0
+        self._last_pass_at: Optional[float] = None
+        self._last_pass_was_prefill = False
         self._pending_chunked_abort_reqs: List[Req] = []
         # Upper bound on how many requests may be mid-prefill at once. Raised
         # above 1 only when the per-request prefill cap is enabled (see
@@ -3220,6 +3233,7 @@ class Scheduler(
         if new_batch is not None:
             # Run prefill first if possible
             ret = new_batch
+            self._note_scheduled_pass(ran_prefill=True)
         else:
             # Run decode (skip for prefill-only batches)
             if not running_batch.is_empty() and not running_batch.is_prefill_only:
@@ -3227,6 +3241,7 @@ class Scheduler(
                 ret = running_batch if not running_batch.is_empty() else None
             else:
                 ret = None
+            self._note_scheduled_pass(ran_prefill=False)
 
         # Handle DP attention and log stats
         ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(
@@ -3276,6 +3291,92 @@ class Scheduler(
                 )
 
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
+
+    # Half-life of the moving average behind the yield diagnostics. Not a
+    # setting: it smooths a number that is only ever logged.
+    _YIELD_STATS_HALF_LIFE_S = 5.0
+
+    def _should_yield_pass_to_decode(self, running_batch: ScheduleBatch) -> bool:
+        """Whether decode should get this scheduling pass instead of prefill.
+
+        Every TP rank runs its own scheduler and they stay in lockstep only
+        because they decide from state they all share. This decision therefore
+        has to be a pure function of that state -- a counter driven by the
+        branch taken, which is itself decided by the counter. Deriving it from
+        anything rank-local (wall-clock time, most obviously) lets the ranks
+        disagree: one runs prefill while the other runs decode, their
+        collectives do not match, and the job hangs inside NCCL with the GPUs
+        spinning and nothing in the log.
+
+        Yields only when there is decode work: a pass given up with an empty or
+        prefill-only running batch is a pass nobody runs. Both conditions read
+        the running batch, which is identical on every rank.
+        """
+        per_prefill = get_schedule().decode_passes_per_prefill
+        if per_prefill <= 0:
+            return False
+        if running_batch.is_empty() or running_batch.is_prefill_only:
+            # Reset so a prefill that resumes after an idle decode stretch does
+            # not immediately owe a full run of yields.
+            self._consecutive_yields = 0
+            return False
+
+        if self._consecutive_yields >= per_prefill:
+            if self._consecutive_yields:
+                logger.info(
+                    "decode-share: resuming prefill after %d decode passes (%s)",
+                    self._consecutive_yields,
+                    self._yield_state_str(),
+                )
+            self._consecutive_yields = 0
+            return False
+
+        self._consecutive_yields += 1
+        return True
+
+    def _yield_state_str(self) -> str:
+        """Measured split, for tuning --decode-passes-per-prefill.
+
+        Rank-local and therefore only ever logged -- feeding a wall-clock
+        measurement back into the decision is what made the ranks diverge.
+        """
+        total = self._prefill_time_acc + self._decode_time_acc
+        ratio = self._decode_time_acc / total if total > 0 else 0.0
+        return (
+            f"decode_time_share={ratio:.3f} "
+            f"prefill_acc={self._prefill_time_acc:.3f}s "
+            f"decode_acc={self._decode_time_acc:.3f}s "
+            f"prefill_pass_est={self._prefill_pass_est:.3f}s"
+        )
+
+    def _note_scheduled_pass(self, ran_prefill: bool) -> None:
+        """Attribute elapsed wall time to prefill or decode, for the log only.
+
+        Measured between scheduling decisions and charged to whichever ran
+        last. This is the number to tune --decode-passes-per-prefill against;
+        it must never feed the decision itself (see
+        _should_yield_pass_to_decode).
+        """
+        if get_schedule().decode_passes_per_prefill <= 0:
+            return
+
+        now = time.perf_counter()
+        if self._last_pass_at is not None:
+            elapsed = max(now - self._last_pass_at, 0.0)
+            decay = 0.5 ** (elapsed / self._YIELD_STATS_HALF_LIFE_S)
+            self._prefill_time_acc *= decay
+            self._decode_time_acc *= decay
+            if self._last_pass_was_prefill:
+                self._prefill_time_acc += elapsed
+                self._prefill_pass_est = (
+                    elapsed
+                    if self._prefill_pass_est == 0.0
+                    else 0.8 * self._prefill_pass_est + 0.2 * elapsed
+                )
+            else:
+                self._decode_time_acc += elapsed
+        self._last_pass_at = now
+        self._last_pass_was_prefill = ran_prefill
 
     def _get_new_batch_prefill_raw(
         self,
@@ -3373,6 +3474,12 @@ class Scheduler(
             prefill_tile_block_m=prefill_tile_block_m,
             long_prefill_token_threshold=get_schedule().long_prefill_token_threshold,
             max_concurrent_chunked_reqs=self.max_concurrent_chunked_reqs,
+            # Yielding runs the adder as usual and lets it park everything:
+            # returning early instead would skip the carried-request re-admit
+            # below, leaving each mid-prefill request holding last pass's
+            # extend_range so the next step re-stashes the same chunk and
+            # leaks its KV and mamba pages.
+            yield_to_decode=self._should_yield_pass_to_decode(running_batch),
         )
 
         # Re-admit the requests carried over from earlier passes, oldest first,
