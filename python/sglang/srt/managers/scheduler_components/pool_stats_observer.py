@@ -81,6 +81,12 @@ class PoolStats:
             if not self.is_hybrid_swa:
                 parts.append(f"full token usage: {self.full_token_usage:.2f}")
             parts.append(f"mamba usage: {self.mamba_usage:.2f}")
+            # Active occupancy alone cannot tell "nothing was ever cached" from
+            # "it was cached and then evicted"; report the radix-side numbers too.
+            if self.mamba_evictable_size is not None:
+                parts.append(f"mamba evictable: {self.mamba_evictable_size}")
+            if self.mamba_available_size is not None:
+                parts.append(f"mamba avail: {self.mamba_available_size}")
         if not parts:
             parts.append(f"token usage: {self.full_token_usage:.2f}")
         return parts
@@ -104,6 +110,10 @@ class PoolStats:
                 f"mamba num: {self.mamba_num_used}",
                 f"mamba usage: {self.mamba_usage:.2f}",
             ]
+            if self.mamba_evictable_size is not None:
+                parts.append(f"mamba evictable: {self.mamba_evictable_size}")
+            if self.mamba_available_size is not None:
+                parts.append(f"mamba avail: {self.mamba_available_size}")
         if self.is_hisparse:
             parts += [
                 f"#gpu token: {self.hisparse_device_tokens}",
