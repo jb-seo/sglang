@@ -505,6 +505,17 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             full_attn_layers = [0]
         else:
             full_attn_layers = cfg.full_attention_layer_ids
+        # The concrete classes actually constructed. The lines above report the
+        # backend *names* config resolved to; this reports what was built, so a
+        # boot log settles the wiring without a profiler run.
+        logger.info(
+            "Hybrid attention wiring: hybrid=%s full=%s linear=%s "
+            "(%d full-attention layers)",
+            hybrid_backend_cls.__name__,
+            type(full_attn_backend).__name__,
+            type(linear_attn_backend).__name__,
+            len(full_attn_layers),
+        )
         return hybrid_backend_cls(
             full_attn_backend, linear_attn_backend, full_attn_layers
         )
