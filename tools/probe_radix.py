@@ -12,12 +12,14 @@ Two modes:
               python3 probe_radix.py --mode ab
 
   simulate  Several sessions that start short and grow a turn at a time, called
-          in random order -- the shape of real multi-window use, where every
-          session's history accumulates while the others push it down the LRU.
-          Reports, per call, how much of the prefix that SHOULD have been
-          cached actually was.
+          in random order and optionally overlapping -- the shape of real
+          multi-window use, where every session's history accumulates while
+          the others push it down the LRU. Each turn carries the previous
+          reply, so the prefix grows the way a chat's does. Reports, per call,
+          how much of the prefix that SHOULD have been cached actually was.
 
-              python3 probe_radix.py --mode simulate --turns 40
+              python3 probe_radix.py --mode simulate --turns 40 \
+                  --concurrency 3 --gen-tokens 256
 
 `ab` answers a yes/no question; `simulate` shows where the hit rate falls off
 as contexts grow and sessions interleave, which is the failure people actually
@@ -26,16 +28,27 @@ hit. Start with `ab`, use `simulate` to find the knee.
 Watch the server log alongside:
     grep -E "Prefill batch|mamba evictable" <serverlog> | tail -40
 """
-import argparse, json, random, sys, time, urllib.request
+import argparse, json, random, sys, threading, time, urllib.request
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 
 
-def gen(url, prompt, timeout=900):
+def gen(url, prompt, max_new_tokens=1, timeout=900):
+    """One call. Returns (secs, prompt_tokens, cached_tokens, completion_tokens,
+    text).
+
+    max_new_tokens matters more than it looks. A request holds its mamba slots
+    for as long as it runs, and crosses a state-tracking boundary every
+    mamba_track_interval decoded tokens -- so a 1-token call measures prefill
+    reuse while barely occupying the server, which is not the workload anyone
+    actually runs.
+    """
     req = urllib.request.Request(
         url + "/generate",
         data=json.dumps(
             {"text": prompt,
-             "sampling_params": {"max_new_tokens": 1, "temperature": 0.0}}
+             "sampling_params": {"max_new_tokens": max_new_tokens,
+                                 "temperature": 0.0}}
         ).encode(),
         headers={"Content-Type": "application/json"},
     )
@@ -44,7 +57,9 @@ def gen(url, prompt, timeout=900):
         out = json.loads(r.read())
     dt = time.perf_counter() - t0
     meta = out.get("meta_info", {}) if isinstance(out, dict) else {}
-    return dt, meta.get("prompt_tokens"), meta.get("cached_tokens")
+    text = out.get("text", "") if isinstance(out, dict) else ""
+    return (dt, meta.get("prompt_tokens"), meta.get("cached_tokens"),
+            meta.get("completion_tokens"), text)
 
 
 def filler(tag, n_words):
@@ -70,7 +85,7 @@ def run_round(url, words, label, other_words=None, tag=""):
     rows = []
     for name, prompt in steps:
         try:
-            dt, ptok, ctok = gen(url, prompt)
+            dt, ptok, ctok, _, _ = gen(url, prompt)
         except Exception as e:
             print(f"  {name:24s} FAILED: {e}", file=sys.stderr)
             rows.append((name, None, None, None))
@@ -113,12 +128,20 @@ class Session:
         self.grow_min, self.grow_max = grow_min, grow_max
         self.words: list[str] = []
         self.turn = 0
-        self.prev_prompt_tokens: int | None = None
+        self.last_reply = ""
+        # What the server should be able to hand back next time: this turn's
+        # prompt plus what it generated, since both are in the tree.
+        self.prev_cacheable_tokens: int | None = None
 
     def next_prompt(self) -> str:
-        """Append a turn's worth of words and return the whole conversation."""
+        """Append the last reply plus a turn's worth of words, and return the
+        whole conversation -- so the previous turn's prompt AND its answer are
+        both a prefix of this one, as in a real chat."""
         n = self.rng.randint(self.grow_min, self.grow_max)
         base = len(self.words)
+        if self.last_reply:
+            self.words += self.last_reply.split()
+            self.last_reply = ""
         self.words += [f"{self.tag}{base + i}" for i in range(n)]
         self.turn += 1
         return " ".join(self.words) + f" turn{self.turn}?"
@@ -131,68 +154,116 @@ def run_simulate(url, args):
         t: Session(t, random.Random(args.seed + i), args.grow_min, args.grow_max)
         for i, t in enumerate(tags)
     }
+    # Fix the call ORDER from the seed, before any timing is involved, so two
+    # runs at different concurrency compare the same workload. Only the
+    # overlap between calls varies.
+    order = [rng.choice(tags) for _ in range(args.turns)]
 
-    print(f"\n{args.sessions} sessions, {args.turns} calls, seed={args.seed}")
+    print(f"\n{args.sessions} sessions, {args.turns} calls, "
+          f"concurrency={args.concurrency}, gen_tokens={args.gen_tokens}, "
+          f"seed={args.seed}")
     print("'reuse' is cached tokens as a fraction of the previous turn's prompt")
-    print("-- the part the tree already held. 100% = perfect, 0% = full recompute.\n")
-    print(f"{'#':>3} {'sess':>4} {'turn':>4} {'prompt':>8} {'cached':>8} "
-          f"{'expect':>8} {'reuse':>7} {'secs':>7}")
+    print("-- the part the tree already held. 100% = perfect, 0% = full recompute.")
+    print("'inflt' is how many calls were in flight when this one was issued.\n")
+    print(f"{'#':>3} {'sess':>4} {'turn':>4} {'inflt':>5} {'prompt':>8} "
+          f"{'cached':>8} {'expect':>8} {'reuse':>7} {'secs':>7}")
 
+    lock = threading.Lock()
+    inflight: set[str] = set()
+    peak = 0
     rows = []
-    for i in range(1, args.turns + 1):
-        sess = sessions[rng.choice(tags)]
-        expect = sess.prev_prompt_tokens
-        prompt = sess.next_prompt()
-        try:
-            dt, ptok, ctok = gen(url, prompt)
-        except Exception as e:
-            print(f"{i:>3} {sess.tag:>4} {sess.turn:>4}  FAILED: {e}", file=sys.stderr)
-            continue
 
+    def do_call(seq, sess, expect, prompt, at_issue):
+        nonlocal rows
+        try:
+            dt, ptok, ctok, gtok, text = gen(url, prompt, args.gen_tokens)
+        except Exception as e:
+            with lock:
+                inflight.discard(sess.tag)
+            print(f"{seq:>3} {sess.tag:>4} {sess.turn:>4}  FAILED: {e}",
+                  file=sys.stderr)
+            return
         reuse = None if not expect else (ctok or 0) / expect
-        print(
-            f"{i:>3} {sess.tag:>4} {sess.turn:>4} {ptok:>8} {ctok:>8} "
-            f"{'-' if expect is None else expect:>8} "
-            f"{'-' if reuse is None else f'{reuse:6.1%}':>7} {dt:>7.2f}"
-        )
-        if reuse is not None:
-            rows.append((sess.tag, expect, reuse))
-        sess.prev_prompt_tokens = ptok
+        with lock:
+            sess.last_reply = text
+            sess.prev_cacheable_tokens = (ptok or 0) + (gtok or 0)
+            inflight.discard(sess.tag)
+            print(
+                f"{seq:>3} {sess.tag:>4} {sess.turn:>4} {at_issue:>5} {ptok:>8} "
+                f"{ctok:>8} {'-' if expect is None else expect:>8} "
+                f"{'-' if reuse is None else f'{reuse:6.1%}':>7} {dt:>7.2f}"
+            )
+            if reuse is not None:
+                rows.append((sess.tag, expect, reuse, at_issue))
+
+    with ThreadPoolExecutor(max_workers=max(args.concurrency, 1)) as pool:
+        futures = []
+        for seq, tag in enumerate(order, 1):
+            # A client keeps at most one request per window open, and turn N+1
+            # is only meaningful after turn N: wait out this session, but let
+            # the others keep running.
+            while True:
+                with lock:
+                    if tag not in inflight and len(inflight) < args.concurrency:
+                        sess = sessions[tag]
+                        expect = sess.prev_cacheable_tokens
+                        prompt = sess.next_prompt()
+                        inflight.add(tag)
+                        at_issue = len(inflight)
+                        peak = max(peak, at_issue)
+                        break
+                time.sleep(0.005)
+            futures.append(pool.submit(do_call, seq, sess, expect, prompt, at_issue))
+        for f in futures:
+            f.result()
 
     if not rows:
         print("\nno reusable turns recorded")
         return
 
-    print("\n" + "=" * 62)
-    print("reuse by context size (the previous turn's prompt)")
-    print("=" * 62)
-    buckets = [(0, 4000), (4000, 16000), (16000, 64000), (64000, 10**9)]
-    for lo, hi in buckets:
-        got = [r for _, e, r in rows if lo <= e < hi]
+    print("\n" + "=" * 68)
+    print(f"reuse by context size (peak concurrency reached: {peak})")
+    print("=" * 68)
+    for lo, hi in [(0, 4000), (4000, 16000), (16000, 64000), (64000, 10**9)]:
+        got = [r for _, e, r, _ in rows if lo <= e < hi]
         if not got:
             continue
         hi_s = "inf" if hi > 10**8 else str(hi)
         print(f"  {lo:>6}-{hi_s:<6} n={len(got):<4} "
               f"mean={sum(got)/len(got):6.1%}  min={min(got):6.1%}")
 
+    print("\nreuse by how many calls were in flight")
+    by_c = defaultdict(list)
+    for _, _, r, c in rows:
+        by_c[c].append(r)
+    for c in sorted(by_c):
+        got = by_c[c]
+        print(f"  {c} in flight  n={len(got):<4} "
+              f"mean={sum(got)/len(got):6.1%}  min={min(got):6.1%}")
+
     per = defaultdict(list)
-    for tag, _, r in rows:
+    for tag, _, r, _ in rows:
         per[tag].append(r)
     print("\nreuse by session")
     for tag in sorted(per):
         got = per[tag]
-        print(f"  {tag}  n={len(got):<4} mean={sum(got)/len(got):6.1%}  min={min(got):6.1%}")
+        print(f"  {tag}  n={len(got):<4} mean={sum(got)/len(got):6.1%}  "
+              f"min={min(got):6.1%}")
 
-    overall = sum(r for _, _, r in rows) / len(rows)
-    print(f"\noverall mean reuse: {overall:.1%}")
+    total = [r for _, _, r, _ in rows]
+    print(f"\noverall mean reuse: {sum(total)/len(total):.1%}   "
+          f"total wipeouts (0%): {sum(1 for r in total if r < 0.01)}")
     print("""
-  near 100% throughout      -> the cache is doing its job; look elsewhere.
-  falls off as size grows   -> length-dependent eviction. Compare the knee
-                               against --max-mamba-cache-size and the
-                               chunks-per-prefill count.
-  collapses to ~0 for some  -> those turns lost their whole prefix, not part
-                               of it. That is a tombstoned/absent checkpoint,
-                               not gradual pressure.
+  Run the same seed at --concurrency 1 and again higher. Same call order and
+  same prompts, so a reuse figure that only drops at the higher setting is
+  concurrency, not context size -- concurrent requests hold mamba slots while
+  they run, on top of the checkpoints the tree already holds.
+
+  --gen-tokens is the other half of that. Slots are held for the length of a
+  generation, so a short one understates the pressure a real session applies;
+  it also decides whether a request ever crosses a decode-side state-tracking
+  boundary. Compare a realistic value against 1 before concluding anything
+  about concurrency.
 """)
 
 
@@ -209,6 +280,12 @@ def main():
     ap.add_argument("--grow-max", type=int, default=2500,
                     help="simulate: most words a turn adds")
     ap.add_argument("--seed", type=int, default=0, help="simulate: reproducible order")
+    ap.add_argument("--concurrency", type=int, default=1,
+                    help="simulate: max calls in flight (1 = strictly serial)")
+    ap.add_argument("--gen-tokens", type=int, default=256,
+                    help="simulate: tokens each call generates. 1 measures "
+                         "prefill reuse only; a request holds its mamba slots "
+                         "for as long as it runs, so keep this realistic.")
     ap.add_argument("--repeat", type=int, default=3,
                     help="ab: repeats per cell (1 tells you nothing)")
     a = ap.parse_args()
